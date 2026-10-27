@@ -1,4 +1,4 @@
-# token-saver: a Claude Code plugin
+# Token Saver
 
 **A plugin for [Claude Code](https://claude.com/claude-code) that saves tokens.** Your computer does the heavy reading locally and for free: text recognition, face detection, video scene sheets, file search and file outlines. Claude then reads a one-page summary and at most two images, instead of every screenshot, video frame or long file.
 
