@@ -1,0 +1,928 @@
+#!/usr/bin/python3 -I
+"""tokprep — do the heavy reading locally, hand Claude one page and at most two images.
+
+  tokprep web   <url|file.html[#anchor]> [--widths 1440,390] [--select CSS]   layout check of a page
+  tokprep media <image|video|folder>...                                       images and video frames
+  tokprep file  <path>                                                        outline of a long file
+  tokprep peek  <file> <start> [end]      print lines, long/minified lines clipped
+  tokprep grep  <regex> <file>...         grep -n, long/minified lines clipped
+
+  tokprep ocr    <image|folder>... [--fast]                       text in images (Apple Vision), as text
+  tokprep faces  <image|folder>...                                face boxes + one sheet of face crops
+  tokprep cutout <image|video|folder>... [--bg transparent|green|blue|#hex|bg.jpg] [--mode auto|subject|person] [-o dir]
+  tokprep key    <image|video>... [--color auto|green|blue|0xRRGGBB] [--similarity 0.12] [--bg transparent|bg.jpg] [-o dir]
+  tokprep find   <words>... [--in dir] [--kind image|video|pdf|doc|code|audio|folder|...] [--days N] [--name] [--limit 30]
+  tokprep scenes <video>... [--threshold 0.3] [--max 24] [--min 1.0]   one frame per scene change (bursts < --min s merged)
+  tokprep asset  <op> <files|folder>... [options] [-o out] [--preview]   ffmpeg edits; `tokprep asset` lists the ops
+
+  tokprep job start <name> [--dest dir]   open a job: temporary files go in its work folder (`tokprep job dir`)
+  tokprep job track <paths>...            register temporary files made elsewhere
+  tokprep job deliver <file> [--to dir]   move/copy the final asset out of the job (never deleted)
+  tokprep job status | list               what is temporary, what is final
+  tokprep job done [--dry-run]            after the final is approved: delete everything temporary, report space freed
+  tokprep clean [--days 7]                delete old prep outputs (summaries, sheets) outside jobs
+
+Results go to $TOKPREP_OUT or ~/.cache/tokprep/<name>/: summary.md plus sheet-1.jpg / sheet-2.jpg.
+"""
+import hashlib, json, os, re, shutil, subprocess, sys, tempfile, time, zipfile, html as htmllib
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent.parent / "lib"
+CLIP = int(os.environ.get("TOKPREP_CLIP", "240"))      # max chars shown per line in peek/grep
+IMG = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".heic", ".tif", ".tiff", ".bmp"}
+VID = {".mp4", ".mov", ".m4v", ".avi", ".mkv", ".webm"}
+
+def tok_text(s): return int(len(s) / 3.6)
+def tok_img(w, h):
+    if not w or not h: return 0
+    s = min(1, 1568 / max(w, h)); w, h = w * s, h * s
+    if w * h > 1_150_000: s = (1_150_000 / (w * h)) ** .5; w, h = w * s, h * s
+    return int(w * h / 750)
+
+# Each tool: the Apple one on macOS, else the Windows one when this machine has it, else NOT AVAILABLE
+# and Claude does the job directly, as it would without tokprep. TOKPREP_NO_APPLE=1 tries the non-Apple path on a Mac.
+IS_MAC = sys.platform == "darwin" and os.environ.get("TOKPREP_NO_APPLE") != "1"
+IS_WIN = os.name == "nt"
+
+def unavailable(what):
+    print(f"NOT AVAILABLE on this machine: {what}. Do this directly instead, the way you would without tokprep "
+          f"(Read the image/PDF/file itself, use your own search).")
+    sys.exit(3)
+
+def winvision(cmd, paths):
+    """Windows' built-in OCR and face detection (WinRT, through Windows PowerShell 5.1). None when not on Windows."""
+    ps = shutil.which("powershell") if IS_WIN else None
+    if not ps: return None
+    r = subprocess.run([ps, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(HERE / "winvision.ps1"), cmd, *map(str, paths)],
+                       capture_output=True, text=True, encoding="utf-8")
+    return r.stdout if r.returncode == 0 and r.stdout.strip() else None
+
+def image_info(paths):
+    """[{path, width, height, text, faces, people}]: Apple Vision, else Windows OCR + faces, else sizes only."""
+    paths = [str(p) for p in paths]
+    if not paths: return []
+    v = vision()
+    if v: return json.loads(subprocess.run([v, "info", *paths], capture_output=True, text=True).stdout or "[]")
+    out = winvision("info", paths)
+    if out:
+        try: return json.loads(out)
+        except ValueError: pass
+    return [dict(zip(("path", "width", "height"), (p, *probe(p)[:2]))) for p in paths]
+
+def small_jpg(src, out):
+    """A ≤1600 px JPEG copy (HEIC too where the OS can read it), so analysis and sheets stay fast."""
+    if IS_MAC: subprocess.run(["sips", "-s", "format", "jpeg", "-Z", "1600", str(src), "--out", str(out)], capture_output=True)
+    else: subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", str(src), "-frames:v", "1", "-vf",
+                          "scale='if(gte(iw,ih),min(iw,1600),-2)':'if(gte(iw,ih),-2,min(ih,1600))'", str(out)], capture_output=True)
+    return out if Path(out).exists() else src
+
+def has_filter(name):
+    return f" {name} " in subprocess.run(["ffmpeg", "-hide_banner", "-filters"], capture_output=True, text=True).stdout
+
+def outdir(kind, name):
+    # while a job is open, prep outputs belong to it and are deleted with it
+    work = None if "TOKPREP_OUT" in os.environ else job_work()
+    base = work / "prep" if work else Path(os.environ.get("TOKPREP_OUT", Path.home() / ".cache" / "tokprep"))
+    d = base / (kind + "-" + re.sub(r"[^\w.-]+", "-", Path(name).stem)[:40] + "-" + hashlib.sha1(name.encode()).hexdigest()[:6])
+    shutil.rmtree(d, ignore_errors=True); d.mkdir(parents=True)
+    return d
+
+def vision():
+    """The Swift helper (Apple Vision OCR, faces, people, cutouts, contact sheets), compiled on first use. None off macOS."""
+    if not IS_MAC or not shutil.which("swiftc"): return None
+    # built outside the plugin folder, so the plugin's files never change on their own
+    exe = Path.home() / ".cache" / "tokprep" / "bin" / "tokvision"
+    src = HERE / "tokvision.swift"
+    exe.parent.mkdir(parents=True, exist_ok=True)
+    if not exe.exists() or exe.stat().st_mtime < src.stat().st_mtime:
+        subprocess.run(["swiftc", "-O", str(src), "-o", str(exe)], check=True, capture_output=True)
+    return str(exe)
+
+def sheet(out, cols, items):
+    """items: [(label, path)] -> one jpg, long edge <= 1568 px. Returns (path, tokens).
+    CoreGraphics on macOS, else ffmpeg (labels only where ffmpeg has drawtext; the summary lists the order anyway)."""
+    v = vision()
+    if v:
+        r = subprocess.run([v, "sheet", str(out), str(cols)] + [f"{l}|{p}" for l, p in items], capture_output=True, text=True, check=True)
+        w, h = map(int, re.search(r"(\d+)x(\d+)", r.stdout).groups())
+        return out, tok_img(w, h)
+    if not shutil.which("ffmpeg"): unavailable("contact sheets (needs ffmpeg)")
+    n = len(items); cols = max(1, min(cols, n)); rows = -(-n // cols)
+    dims = [probe(p)[:2] for _, p in items]
+    aspects = sorted(h / w for w, h in dims if w and h) or [9 / 16]
+    aspect = min(max(aspects[len(aspects) // 2], 0.4), 2.2)
+    gap, label = 6, 22
+    cw = min(1568 // cols - gap, max((w for w, _ in dims), default=480) or 480); ch = int(cw * aspect)
+    if rows * (ch + label + gap) > 1568:
+        k = 1568 / (rows * (ch + label + gap)); cw, ch = int(cw * k), int(ch * k)
+    cw, ch = cw - cw % 2, ch - ch % 2
+    text = has_filter("drawtext")
+    ins, parts = [], []
+    for i, (lab, p) in enumerate(items):
+        ins += ["-i", str(p)]
+        f = f"[{i}:v]scale={cw}:{ch}:force_original_aspect_ratio=decrease,pad={cw}:{ch + label}:(ow-iw)/2:{label}:color=0x1f1f1f"
+        if text: f += ",drawtext=text='" + re.sub(r"[':\\%;,\[\]]", " ", lab) + "':x=4:y=3:fontsize=14:fontcolor=white"
+        parts.append(f + f",setsar=1,format=yuv420p[c{i}]")
+    if n == 1: graph = parts[0].replace("[c0]", "[o]")
+    else:
+        layout = "|".join(f"{(i % cols) * (cw + gap)}_{(i // cols) * (ch + label + gap)}" for i in range(n))
+        graph = ";".join(parts) + ";" + "".join(f"[c{i}]" for i in range(n)) + f"xstack=inputs={n}:layout={layout}:fill=0x1f1f1f[o]"
+    ff(*ins, "-filter_complex", graph, "-map", "[o]", "-frames:v", "1", "-q:v", "3", out)
+    W, H = cols * (cw + gap) - gap, rows * (ch + label + gap) - gap
+    return out, tok_img(W, H)
+
+def finish(d, lines, sheets, before):
+    summary = "\n".join(lines).rstrip() + "\n"
+    (d / "summary.md").write_text(summary)
+    after = tok_text(summary) + sum(t for _, t in sheets)
+    print(f"summary: {d / 'summary.md'}  (~{tok_text(summary):,} tokens)")
+    for p, t in sheets: print(f"image:   {p}  (~{t:,} tokens)")
+    print(f"estimate: before ~{before:,} tokens -> after ~{after:,} tokens ({100 - 100 * after / max(before, 1):.0f}% less)")
+
+# ---------------------------------------------------------------- web
+def cmd_web(args):
+    widths, select = "1440,390", ""
+    if "--widths" in args: i = args.index("--widths"); widths = args.pop(i + 1); args.pop(i)
+    if "--select" in args: i = args.index("--select"); select = args.pop(i + 1); args.pop(i)
+    target = args[0]; d = outdir("web", target + select)
+    raw = d / "raw"
+    cmd = ["node", str(HERE / "webshot.mjs"), target, str(raw), "--widths", widths] + (["--select", select] if select else [])
+    subprocess.run(cmd, check=True, capture_output=True, text=True)
+    rep = json.loads((raw / "report.json").read_text())
+    L = [f"# Page check: {target}" + (f"  `{select}`" if select else ""), ""]
+    before = 0; items_by_w = []
+    for w in rep["widths"]:
+        L.append(f"## {w['viewport']} · page {w['pageHeight']}px tall · horizontal scroll: {w['horizontalScroll']}")
+        for k, title in [("overflow", "past right edge"), ("broken", "broken images"), ("heavy", "oversized images"), ("tiny", "text < 11px"), ("problems", "console / network")]:
+            if w.get(k): L.append(f"- **{title}:** " + "; ".join(w[k]))
+        s = w.get("selected")
+        if s and not s.get("missing"):
+            L.append(f"- **{s['selector']}** at x={s['x']} y={s['y']}, {s['w']}×{s['h']}px · {s['font']} · color {s['color']} on {s['background']}")
+            L.append(f"  text: “{s['text'][:300]}”")
+        elif s: L.append(f"- **{s['selector']} not found** at this width")
+        if w["outline"]:
+            L.append("- sections: " + " · ".join(f"{o['id'] or o['text'][:24]}@{o['y']}" for o in w["outline"][:14]))
+        L.append("")
+        # before = what reading these as raw screenshots costs (full-page or per-section shots at 1:1)
+        for sh in w["shots"]:
+            before += tok_img(w["width"], min(int(w["pageHeight"]), 900) if not s else 900)
+        items_by_w.append([(sh["label"], sh["file"]) for sh in w["shots"]])
+    # two images max: with --select both widths share one sheet; else one sheet per width (first two widths)
+    sheets = []
+    allshots = [i for g in items_by_w for i in g]
+    if select or len(allshots) <= 4: sheets.append(sheet(d / "sheet-1.jpg", len(allshots), allshots))
+    else:
+        for n, g in enumerate(items_by_w[:2], 1): sheets.append(sheet(d / f"sheet-{n}.jpg", 4 if rep["widths"][n - 1]["width"] < 700 else 2, g))
+    L.append("Images: " + ", ".join(Path(p).name for p, _ in sheets) + " — labelled slices, layout only; trust the numbers above for exact sizes.")
+    L.append(f"Full-resolution slices (read one only if needed): {raw}/")
+    finish(d, L, sheets, before)
+
+# ---------------------------------------------------------------- media
+def ffprobe(p):
+    r = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration:stream=codec_type,width,height,r_frame_rate", "-of", "json", str(p)], capture_output=True, text=True)
+    j = json.loads(r.stdout or "{}"); v = next((s for s in j.get("streams", []) if s.get("codec_type") == "video"), {})
+    return float(j.get("format", {}).get("duration", 0) or 0), v.get("width", 0), v.get("height", 0), any(s.get("codec_type") == "audio" for s in j.get("streams", []))
+
+def transcribe(p, tmp):
+    for exe in ("whisper-cli", "whisper-cpp", "mlx_whisper", "whisper"):
+        if shutil.which(exe): break
+    else: return None
+    wav = Path(tmp) / (p.stem + ".wav")
+    subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", str(p), "-ar", "16000", "-ac", "1", str(wav)], check=True)
+    if exe in ("whisper-cli", "whisper-cpp"):
+        model = os.environ.get("TOKPREP_WHISPER_MODEL", str(Path.home() / ".cache/whisper/ggml-base.bin"))
+        r = subprocess.run([exe, "-m", model, "-nt", "-l", "auto", "-f", str(wav)], capture_output=True, text=True)
+    else:
+        r = subprocess.run([exe, str(wav), "--output-format", "txt", "--output-dir", tmp], capture_output=True, text=True)
+        r.stdout = (Path(tmp) / (wav.stem + ".txt")).read_text() if (Path(tmp) / (wav.stem + ".txt")).exists() else r.stdout
+    return re.sub(r"\s+", " ", r.stdout).strip()
+
+def cmd_media(args):
+    files = []
+    for a in map(Path, args):
+        files += sorted(f for f in a.rglob("*") if f.suffix.lower() in IMG | VID) if a.is_dir() else [a]
+    imgs = [f for f in files if f.suffix.lower() in IMG]; vids = [f for f in files if f.suffix.lower() in VID]
+    d = outdir("media", args[0] if len(args) == 1 else "set-" + str(len(files)))
+    tmp = tempfile.mkdtemp(prefix="tokprep-")
+    L = [f"# Media prep: {len(imgs)} images, {len(vids)} videos", ""]; before = 0; sheets = []; tiles = []
+    # small jpg copies (HEIC included) so the analysis and the sheet read them fast
+    small = [small_jpg(f, Path(tmp) / (hashlib.sha1(str(f).encode()).hexdigest()[:8] + ".jpg")) for f in imgs]
+    if imgs:
+        info = image_info(small)
+        L.append("## Images")
+        for f, i in zip(imgs, info):
+            w, h = probe(f)[:2]
+            if not w: w, h = i.get("width", 0), i.get("height", 0)
+            before += tok_img(w, h)
+            bits = [f"{w}×{h}", f"{f.stat().st_size // 1024} KB"]
+            if i.get("faces"): bits.append(f"{i['faces']} face(s)")
+            if i.get("people"): bits.append(f"{i['people']} person(s)")
+            t = i.get("text", "")
+            L.append(f"- **{f.name}** — " + ", ".join(bits) + (f" — text: “{t[:160]}{'…' if len(t) > 160 else ''}”" if t else ""))
+        L.append("")
+        tiles += [(f.name[:22], str(s)) for f, s in zip(imgs, small)]
+    for v in vids:
+        dur, w, h, audio = ffprobe(v)
+        frames, scenes, mode, bursts = scene_frames(v, tmp, 12 if len(vids) == 1 else 6)
+        frames = [(f"{v.stem[:10]} {label}", p) for label, p in frames]
+        before += len(frames) * tok_img(w or 1920, h or 1080)          # the old way: one Read per frame at full size
+        L.append(f"## Video {v.name} — {int(dur // 60)}:{int(dur % 60):02d}, {w}×{h}, {'audio' if audio else 'no audio'}, "
+                 + (f"{len(scenes)} scenes" if mode == "scene" else "no clear cuts (frames evenly spaced)"))
+        if frames:
+            info = image_info([p for _, p in frames])
+            texts = sorted({i["text"] for i in info if i.get("text")})
+            people = max((i.get("people", 0) for i in info), default=0)
+            if texts: L.append("- on-screen text: " + " | ".join(t[:80] for t in texts[:6]))
+            L.append(f"- most people in one frame: {people}")
+        if audio:
+            tr = transcribe(v, tmp)
+            if tr is None: L.append("- transcript: not made (no local Whisper installed)")
+            elif not re.sub(r"[\[(][^\])]*[\])]|\W", "", tr):     # only [Music] / (applause) tags
+                L.append("- audio: no speech (" + (re.search(r"[\[(]([^\])]*)", tr).group(1) if re.search(r"[\[(]", tr) else "silence") + ")")
+            else:
+                before += tok_text(tr) * 2      # raw .srt/.vtt with timestamps is about twice the plain text
+                (d / f"{v.stem}.transcript.txt").write_text(tr)
+                L.append(f"- transcript ({tok_text(tr):,} tokens, saved next to this file): “{tr[:400]}…”")
+        L.append("")
+        tiles += frames
+    # at most two sheets; beyond 48 tiles, sample evenly
+    if len(tiles) > 48: step = len(tiles) / 48; tiles = [tiles[int(i * step)] for i in range(48)]
+    for n, chunk in enumerate([tiles[:24], tiles[24:48]], 1):
+        if chunk: sheets.append(sheet(d / f"sheet-{n}.jpg", min(6, max(2, round(len(chunk) ** .5 + .5))), chunk))
+    L.append("Images: " + ", ".join(Path(p).name for p, _ in sheets) + " — labelled thumbnails in the order listed above.")
+    finish(d, L, sheets, before)
+    shutil.rmtree(tmp, ignore_errors=True)
+
+# ---------------------------------------------------------------- long files
+def to_text(p):
+    ext = p.suffix.lower()
+    if ext in (".docx", ".doc", ".rtf", ".odt", ".pages", ".webarchive") and IS_MAC:
+        return subprocess.run(["textutil", "-convert", "txt", "-stdout", str(p)], capture_output=True, text=True).stdout
+    if ext in (".docx", ".odt"):        # elsewhere: the text straight out of the document's XML
+        z = zipfile.ZipFile(p); xml = z.read("word/document.xml" if ext == ".docx" else "content.xml").decode("utf8", "ignore")
+        return htmllib.unescape(re.sub(r"<[^>]+>", "", re.sub(r"</w:p>|</text:p>|</text:h>", "\n", xml)))
+    if ext in (".doc", ".rtf", ".pages", ".webarchive"): unavailable(f"reading {ext} files (macOS textutil)")
+    if ext == ".pdf" and not IS_MAC:
+        if shutil.which("pdftotext"): return subprocess.run(["pdftotext", "-layout", str(p), "-"], capture_output=True, text=True).stdout
+        unavailable("PDF text (macOS PDFKit / pdftotext); Read the PDF with its pages option")
+    if ext == ".pdf":
+        swift = 'import PDFKit; let d = PDFDocument(url: URL(fileURLWithPath: CommandLine.arguments[1]))!; for i in 0..<d.pageCount { print("\\u{0C}" + (d.page(at: i)?.string ?? "")) }'
+        f = Path(tempfile.mkdtemp()) / "pdf.swift"; f.write_text(swift)
+        return subprocess.run(["swift", str(f), str(p)], capture_output=True, text=True).stdout
+    if ext == ".epub":
+        z = zipfile.ZipFile(p); parts = [n for n in z.namelist() if n.endswith((".xhtml", ".html", ".htm"))]
+        return "\n".join("\f" + htmllib.unescape(re.sub(r"<[^>]+>", " ", z.read(n).decode("utf8", "ignore"))) for n in parts)
+    if ext in (".srt", ".vtt"):
+        t = p.read_text(errors="ignore")
+        t = re.sub(r"^\d+\s*$|^[\d:.,]+ --> .*$|^WEBVTT.*$", "", t, flags=re.M)
+        lines = [l.strip() for l in t.splitlines() if l.strip()]
+        return "\n".join(l for i, l in enumerate(lines) if i == 0 or l != lines[i - 1])
+    return p.read_text(errors="ignore")
+
+def outline_code(p):
+    r = subprocess.run(["ctags", "-x", "--_xformat=%N\t%K\t%n", "-f", "-", str(p)], capture_output=True, text=True) if shutil.which("ctags") else None
+    rows = [l.split("\t") for l in (r.stdout.splitlines() if r else []) if l.count("\t") == 2]
+    keep = [x for x in rows if x[1] in ("function", "class", "method", "variable", "constant", "id", "anchor", "heading1", "heading2", "chapter", "section", "selector", "member")
+            and not x[0].startswith("anonymous")]
+    return sorted(keep, key=lambda x: int(x[2]))
+
+def cmd_file(args):
+    p = Path(args[0]); raw = to_text(p); lines = raw.splitlines()
+    d = outdir("file", str(p)); before = tok_text(raw)
+    L = [f"# File outline: {p.name}", "", f"{len(lines):,} lines · {len(raw):,} chars · reading it whole ≈ {before:,} tokens", ""]
+    long = [(i + 1, len(l), l.strip()[:60]) for i, l in enumerate(lines) if len(l) > 500]
+    if long:
+        L.append("## Lines to avoid (minified / very long)")
+        for n, c, head in long[:12]: L.append(f"- line {n}: {c:,} chars ≈ {c * 10 // 36:,} tokens — `{head}`")
+        L.append(f"Use `tokprep peek` / `tokprep grep`: they clip lines at {CLIP} chars.\n")
+    ext = p.suffix.lower()
+    if ext in (".html", ".htm"):
+        L.append("## Structure (line: element)")
+        blocks = []
+        for i, l in enumerate(lines, 1):
+            m = re.search(r"<(section|header|footer|nav|main|article|template|dialog|script|style|h[1-3])\b([^>]*)>", l, re.I)
+            if not m: continue
+            idm = re.search(r'\bid="([^"]+)"', m.group(2)); src = re.search(r'\bsrc="([^"]+)"', m.group(2))
+            tag = m.group(1).lower()
+            if tag in ("script", "style"):
+                end = next((j for j in range(i - 1, min(len(lines), i + 20000)) if f"</{tag}>" in lines[j].lower()), i - 1) + 1
+                blocks.append(f"{i}-{end}: <{tag}{' #' + idm.group(1) if idm else ''}{' src=' + src.group(1) if src else ''}> {end - i + 1} lines")
+            elif idm or tag.startswith("h"):
+                text = re.sub(r"<[^>]+>", "", l).strip()[:50]
+                blocks.append(f"{i}: <{tag}{' #' + idm.group(1) if idm else ''}> {text}")
+        L += [f"- {b}" for b in blocks[:70]]
+        if len(blocks) > 70: L.append(f"- … {len(blocks) - 70} more")
+        fns = [(i + 1, m.group(1)) for i, l in enumerate(lines) for m in [re.search(r"^\s*(?:async\s+)?function\s+(\w+)|^\s*(?:const|let)\s+(\w+)\s*=\s*(?:async\s*)?\(", l)] if m and (m.group(1) or m.group(2))]
+        fns = [(n, re.search(r"function\s+(\w+)|(?:const|let)\s+(\w+)", lines[n - 1]).group(0).split()[-1]) for n, _ in fns]
+        if fns: L += ["", "## Script functions", " · ".join(f"{name}:{n}" for n, name in fns[:80])]
+    elif ext in (".md", ".txt", ".docx", ".doc", ".rtf", ".pdf", ".epub", ".srt", ".vtt", ".pages", ".odt"):
+        heads = [(i + 1, l.strip()) for i, l in enumerate(lines) if re.match(r"^#{1,3} |^[A-ZÀ-Ý0-9][A-ZÀ-Ý0-9 .,'’:–-]{6,60}$|^(Capitolo|Chapter|Parte|Part)\b", l.strip())]
+        pages = raw.count("\f")
+        if pages: L.append(f"{pages} pages/chapters\n")
+        L.append("## Headings (line: text)")
+        L += [f"- {n}: {h[:80]}" for n, h in heads[:60]]
+        # extractive gist: the first substantial sentence after each heading
+        L.append("\n## Gist (first sentence under each heading)")
+        for n, h in heads[:25]:
+            nxt = next((lines[j].strip() for j in range(n, min(n + 15, len(lines))) if len(lines[j].strip()) > 60), "")
+            first = re.split(r"(?<=[.!?])\s", nxt)[0][:180]
+            if nxt: L.append(f"- {h[:40]}: {first}")
+        if ext not in (".md", ".txt"): (d / (p.stem + ".txt")).write_text(raw); L.append(f"\nPlain text saved: {d / (p.stem + '.txt')} — grep it, don't read it whole.")
+    else:
+        tags = outline_code(p)
+        head = []                                   # the file's own header comment, if any
+        for l in lines[:25]:
+            t = l.strip()
+            if not t and head: break
+            if re.match(r"^(//|#|/\*|\*|--|\"\"\")", t) and re.search(r"\w{3}", t): head.append(re.sub(r"^(//+|#+|/\*+|\*+/?|--)\s?", "", t))
+            elif head: break
+        if head: L += ["## Header comment"] + [f"> {h}" for h in head[:8]] + [""]
+        L.append("## Symbols (line kind name)")
+        L += [f"- {ln} {k} {n}" for n, k, ln in tags[:90]]
+        if len(tags) > 90: L.append(f"- … {len(tags) - 90} more")
+        imp = [l.strip()[:100] for l in lines[:80] if re.match(r"\s*(import|from|require|#include|using)\b", l)]
+        if imp: L += ["", "## Imports"] + [f"- {x}" for x in imp[:15]]
+    finish(d, L, [], before)
+
+# ---------------------------------------------------------------- clipped views
+def clip(l):
+    return l if len(l) <= CLIP else l[:CLIP] + f" …[+{len(l) - CLIP:,} chars clipped]"
+
+def cmd_peek(args):
+    p, a = Path(args[0]), int(args[1]); b = int(args[2]) if len(args) > 2 else a + 40
+    for i, l in enumerate(p.read_text(errors="ignore").splitlines()[a - 1:b], a): print(f"{i}: {clip(l)}")
+
+def cmd_grep(args):
+    pat = re.compile(args[0])
+    for f in args[1:]:
+        for i, l in enumerate(Path(f).read_text(errors="ignore").splitlines(), 1):
+            if pat.search(l):
+                m = pat.search(l); s = max(0, m.start() - CLIP // 2) if len(l) > CLIP else 0
+                print(f"{f + ':' if len(args) > 2 else ''}{i}: " + clip(("…" if s else "") + l[s:]))
+
+# ---------------------------------------------------------------- shared helpers for the commands below
+def opt(args, name, default=None, flag=False):
+    """Pop `--name value` (or a bare `--name` when flag) out of args."""
+    if name not in args: return default
+    i = args.index(name)
+    if flag: args.pop(i); return True
+    v = args.pop(i + 1); args.pop(i); return v
+
+def expand(args, exts):
+    files = []
+    for a in map(Path, args):
+        files += sorted(f for f in a.rglob("*") if f.suffix.lower() in exts and not f.name.startswith(".")) if a.is_dir() else [a]
+    return files
+
+def probe(p):
+    """width, height, duration, fps, has_audio for an image or a video."""
+    r = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration:stream=codec_type,width,height,avg_frame_rate",
+                        "-of", "json", str(p)], capture_output=True, text=True)
+    j = json.loads(r.stdout or "{}"); s = j.get("streams", [])
+    v = next((x for x in s if x.get("codec_type") == "video"), {})
+    if IS_MAC and Path(p).suffix.lower() in IMG:     # sips knows the real size (ffprobe sees HEIC as 512px tiles)
+        m = re.findall(r"pixel(?:Width|Height): (\d+)", subprocess.run(["sips", "-g", "pixelWidth", "-g", "pixelHeight", str(p)], capture_output=True, text=True).stdout)
+        if len(m) == 2: v = {**v, "width": int(m[0]), "height": int(m[1])}
+    num, _, den = (v.get("avg_frame_rate") or "0/1").partition("/")
+    fps = float(num) / float(den or 1) if float(den or 1) else 0
+    return v.get("width", 0), v.get("height", 0), float(j.get("format", {}).get("duration", 0) or 0), fps, any(x.get("codec_type") == "audio" for x in s)
+
+def free_path(p):
+    """Never overwrite: name.ext -> name-1.ext -> name-2.ext ..."""
+    p = Path(p); n = 1
+    while p.exists(): p = p.with_name(f"{p.stem.rsplit('-', 1)[0] if n > 1 else p.stem}-{n}{p.suffix}"); n += 1
+    return p
+
+def kb(p): s = Path(p).stat().st_size; return f"{s / 1048576:.1f} MB" if s > 1048576 else f"{s // 1024} KB"
+def mmss(t): return f"{int(t // 60)}:{t % 60:04.1f}"
+
+def ff(*a):
+    r = subprocess.run(["ffmpeg", "-hide_banner", "-v", "error", "-y", *map(str, a)], capture_output=True, text=True)
+    if r.returncode: sys.exit("ffmpeg failed: " + r.stderr.strip()[-600:])
+
+# ---------------------------------------------------------------- text recognition
+def cmd_ocr(args):
+    fast = opt(args, "--fast", flag=True)
+    files = [f for f in expand(args, IMG) if f.suffix.lower() in IMG]
+    if not files: sys.exit("no images given (png, jpg, heic, …)")
+    d = outdir("ocr", args[0] if len(args) == 1 else f"set-{len(files)}")
+    v = vision()
+    out = subprocess.run([v, "ocr"] + (["--fast"] if fast else []) + [str(f) for f in files], capture_output=True, text=True).stdout if v \
+        else winvision("ocr", files)
+    if out is None: unavailable("text recognition (Apple Vision / Windows OCR)")
+    text = out.strip() + "\n"
+    (d / "text.md").write_text(text)
+    before = sum(tok_img(*probe(f)[:2]) or 1200 for f in files)
+    print(text if len(text) < 6000 else text[:6000] + f"\n… cut here; full text: {d / 'text.md'}")
+    print(f"estimate: reading the {len(files)} image(s) ~{before:,} tokens -> text ~{tok_text(text):,} tokens")
+
+# ---------------------------------------------------------------- face detection
+def cmd_faces(args):
+    files = expand(args, IMG)
+    d = outdir("faces", args[0] if len(args) == 1 else f"set-{len(files)}")
+    crops = d / "crops"; crops.mkdir()
+    v = vision()
+    if v: res = json.loads(subprocess.run([v, "faces", "--crops", str(crops)] + [str(f) for f in files], capture_output=True, text=True).stdout)
+    else:
+        out = winvision("faces", files)
+        if out is None: unavailable("face detection (Apple Vision / Windows FaceDetector)")
+        res = json.loads(out)
+        for r in res:                    # Windows gives boxes only: crop them with ffmpeg, 30% margin
+            for i, f in enumerate(r.get("faces", [])):
+                W, H = r["width"], r["height"]; m = int(f["w"] * .3)
+                x, y = max(0, f["x"] - m), max(0, f["y"] - m); cw, ch = min(W - x, f["w"] + 2 * m), min(H - y, f["h"] + 2 * m)
+                c = crops / f"{Path(r['path']).stem}-face{i + 1}.jpg"; ff("-i", r["path"], "-vf", f"crop={cw}:{ch}:{x}:{y}", "-frames:v", "1", c)
+                f["crop"] = str(c)
+    L = [f"# Faces: {sum(len(r.get('faces', [])) for r in res)} in {len(files)} image(s)", "",
+         "Boxes are x,y (top-left) w×h in pixels; quality 0–1 is Apple's capture quality (sharpness, pose, light).", ""]
+    tiles = []
+    for r in res:
+        fs = r.get("faces", [])
+        L.append(f"- **{Path(r['path']).name}** ({r.get('width')}×{r.get('height')}): " +
+                 ("; ".join(f"{f['x']},{f['y']} {f['w']}×{f['h']}" + (f" q{f['quality']}" if "quality" in f else "") for f in fs) if fs else "no faces"))
+        tiles += [(f"{Path(r['path']).stem[:14]} #{i + 1}", f["crop"]) for i, f in enumerate(fs) if "crop" in f]
+    sheets = [sheet(d / "sheet-1.jpg", min(8, max(2, len(tiles))), tiles[:32])] if tiles else []
+    if sheets: L += ["", "sheet-1.jpg: the face crops, labelled file #n in the order above."]
+    finish(d, L, sheets, sum(tok_img(r.get("width", 1), r.get("height", 1)) for r in res))
+
+# ---------------------------------------------------------------- green screen
+def cmd_cutout(args):
+    """Cut the subject (or people) out of photos or a video with Apple Vision; new background or alpha."""
+    bg, mode, out = opt(args, "--bg", "transparent"), opt(args, "--mode", "auto"), opt(args, "-o")
+    files = expand(args, IMG | VID)
+    d = Path(out) if out else outdir("cutout", args[0] if len(args) == 1 else f"set-{len(files)}")
+    d.mkdir(parents=True, exist_ok=True)
+    L = [f"# Cutout ({mode}, background: {bg})", ""]; tiles = []; vid_before = 0
+    vis = v = vision(); rembg = shutil.which("rembg")
+    if not v and not rembg: unavailable("subject cutout (Apple Vision / rembg)")
+    if not v: L.append("(rembg: no coverage numbers — check the sheet)")
+    imgs = [f for f in files if f.suffix.lower() in IMG]
+    if imgs:
+        if v:
+            r = subprocess.run([v, "cutout", mode, bg, str(d)] + [str(f) for f in imgs], capture_output=True, text=True)
+            L.append(f"- photos: {r.stdout.strip()}")
+        else:
+            for f in imgs: rembg_one(rembg, f, d / (f.stem + ".png"), bg)
+            L.append(f"- photos: cut out {sum((d / (f.stem + '.png')).exists() for f in imgs)}/{len(imgs)} with rembg")
+        for f in imgs[:6]:
+            if (d / (f.stem + ".png")).exists(): tiles += [(f"{f.stem[:14]} before", str(f)), (f"{f.stem[:14]} after", str(d / (f.stem + ".png")))]
+        L.append(f"- PNGs in {d}/")
+    for v in (f for f in files if f.suffix.lower() in VID):
+        w, h, dur, fps, audio = probe(v)
+        tmp = Path(tempfile.mkdtemp(prefix="tokprep-")); src, dst = tmp / "src", tmp / "dst"; src.mkdir(); dst.mkdir()
+        ff("-i", v, "-fps_mode", "passthrough", src / "f%06d.png")
+        frames = sorted(map(str, src.glob("*.png")))
+        notes = []
+        if vis:
+            for i in range(0, len(frames), 400):          # batches keep the argument list short
+                notes.append(subprocess.run([vis, "cutout", mode, bg, str(dst)] + frames[i:i + 400], capture_output=True, text=True).stdout.strip())
+        else:
+            subprocess.run([rembg, "p", str(src), str(dst)], capture_output=True)   # transparent PNGs; background added at encode
+            notes.append("rembg")
+        alpha = bg == "transparent"
+        target = free_path(d / (v.stem + ("-cutout.mov" if alpha else "-cutout.mp4")))
+        enc = ["-c:v", "prores_ks", "-profile:v", "4", "-pix_fmt", "yuva444p10le"] if alpha else ["-c:v", "libx264", "-crf", "18", "-pix_fmt", "yuv420p", "-movflags", "+faststart"]
+        if vis or alpha:
+            ff("-framerate", f"{fps or 30:.3f}", "-i", dst / "f%06d.png", "-i", v, "-map", "0:v", "-map", "1:a?", *enc, "-c:a", "aac", "-shortest", target)
+        else:
+            bgin, bgf = background_input(bg, w, h, fps or 30)
+            ff("-framerate", f"{fps or 30:.3f}", "-i", dst / "f%06d.png", *bgin, "-i", v, "-filter_complex", f"{bgf}[b];[b][0:v]overlay=shortest=1,format=yuv420p[o]",
+               "-map", "[o]", "-map", "2:a?", *enc, "-c:a", "aac", "-shortest", target)
+        vid_before += 4 * tok_img(w, h)      # checking a cutout by eye: a few full-size frames, before and after
+        L.append(f"- video **{v.name}** ({mmss(dur)}, {len(frames)} frames) -> {target.name} ({kb(target)}): " + notes[0].split(" · ")[-1].split(";")[0])
+        mid = sorted(dst.glob("*.png"))
+        for label, p in [("first", mid[0]), ("middle", mid[len(mid) // 2])] if mid else []:
+            keep = d / f"{v.stem}-{label}.png"; shutil.copy(p, keep); tiles.append((f"{v.stem[:12]} {label}", str(keep)))
+        shutil.rmtree(tmp, ignore_errors=True)
+    sheets = [sheet(d / "sheet-1.jpg", 4, tiles[:12])] if tiles else []
+    if sheets: L += ["", "sheet-1.jpg: before/after pairs — look only if the coverage numbers above look wrong (0% = nothing found, >80% = background kept)."]
+    finish(d, L, sheets, sum(tok_img(*probe(f)[:2]) for f in imgs) * 2 + vid_before)
+
+def background_input(bg, w, h, fps):
+    """ffmpeg input args + filter label [1:v]-based chain that makes a w×h background: a colour or an image."""
+    colours = {"green": "0x00B140", "blue": "0x0047BB"}
+    if bg in colours or bg.startswith("#"):
+        c = colours.get(bg, "0x" + bg.lstrip("#"))
+        return ["-f", "lavfi", "-i", f"color=c={c}:s={w}x{h}:r={fps:.3f}"], "[1:v]null"
+    return ["-loop", "1", "-i", bg], f"[1:v]scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h}"
+
+def rembg_one(rembg, src, out, bg):
+    """One photo cut out with rembg (any OS), then put on the background with ffmpeg unless transparent."""
+    if bg == "transparent":
+        subprocess.run([rembg, "i", str(src), str(out)], capture_output=True); return
+    tmp = Path(tempfile.mkdtemp()) / "fg.png"
+    subprocess.run([rembg, "i", str(src), str(tmp)], capture_output=True)
+    if not tmp.exists(): return
+    w, h = probe(tmp)[:2]
+    bgin, bgf = background_input(bg, w, h, 1)
+    ff("-i", tmp, *bgin, "-filter_complex", f"{bgf}[b];[b][0:v]overlay", "-frames:v", "1", out)
+
+def corner_color(p):
+    """Average colour of the four corners of the first frame: the screen colour, most of the time."""
+    w, h = probe(p)[:2]; cols = []
+    for x, y in [(0, 0), (w - 32, 0), (0, h - 32), (w - 32, h - 32)]:
+        r = subprocess.run(["ffmpeg", "-v", "error", "-i", str(p), "-frames:v", "1", "-vf", f"crop=32:32:{x}:{y},scale=1:1", "-f", "rawvideo", "-pix_fmt", "rgb24", "-"], capture_output=True)
+        if len(r.stdout) == 3: cols.append(tuple(r.stdout))
+    # keep corners that are clearly green or blue, average them
+    keyed = [c for c in cols if max(c[1], c[2]) > c[0] + 40] or cols
+    return "0x" + "".join(f"{sum(c[i] for c in keyed) // len(keyed):02X}" for i in range(3))
+
+def cmd_key(args):
+    """Remove an existing green/blue screen with ffmpeg chromakey (+ despill); optional new background."""
+    color, sim, blend = opt(args, "--color", "auto"), opt(args, "--similarity", "0.12"), opt(args, "--blend", "0.06")
+    bg, out = opt(args, "--bg", "transparent"), opt(args, "-o")
+    files = expand(args, IMG | VID)
+    d = Path(out) if out else outdir("key", args[0] if len(args) == 1 else f"set-{len(files)}")
+    d.mkdir(parents=True, exist_ok=True)
+    L = ["# Chroma key", ""]; tiles = []
+    for f in files:
+        c = {"green": "0x00B140", "blue": "0x0047BB"}.get(color, color)
+        if c == "auto": c = corner_color(f)
+        spill = "blue" if int(c[6:8], 16) > int(c[4:6], 16) else "green"
+        key = f"chromakey={c}:{sim}:{blend},despill=type={spill}"
+        w, h, dur, fps, audio = probe(f)
+        is_vid = f.suffix.lower() in VID
+        if bg == "transparent":
+            target = free_path(d / (f.stem + ("-keyed.mov" if is_vid else "-keyed.png")))
+            enc = ["-c:v", "prores_ks", "-profile:v", "4", "-pix_fmt", "yuva444p10le", "-c:a", "aac"] if is_vid else ["-frames:v", "1"]
+            ff("-i", f, "-vf", f"{key},format=yuva444p10le" if is_vid else key, *enc, target)
+        else:
+            target = free_path(d / (f.stem + ("-keyed.mp4" if is_vid else "-keyed.jpg")))
+            graph = f"[1:v]scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h}[b];[0:v]{key}[k];[b][k]overlay=shortest=1,format=yuv420p"
+            enc = ["-map", "0:a?", "-c:v", "libx264", "-crf", "18", "-c:a", "aac", "-movflags", "+faststart"] if is_vid else ["-frames:v", "1", "-q:v", "2"]
+            ff("-i", f, "-loop", "1", "-i", bg, "-filter_complex", graph, *enc, target)
+        L.append(f"- **{f.name}** -> {target.name} ({kb(target)}) · key colour {c}, similarity {sim}, blend {blend}, despill {spill}")
+        prev = target
+        if is_vid:
+            prev = d / f"{f.stem}-keyed-mid.png"; ff("-ss", f"{dur / 2:.2f}", "-i", target, "-frames:v", "1", prev)
+        tiles += [(f"{f.stem[:14]} before", str(f) if not is_vid else str(prev)), (f"{f.stem[:14]} keyed", str(prev))] if not is_vid else [(f"{f.stem[:14]} keyed mid", str(prev))]
+    L += ["", "Edges with a green halo: raise --similarity (0.15–0.2). Holes in the subject: lower it (0.08)."]
+    sheets = [sheet(d / "sheet-1.jpg", 4, tiles[:12])] if tiles else []
+    finish(d, L, sheets, sum(tok_img(*probe(f)[:2]) for f in files) * 2)
+
+# ---------------------------------------------------------------- Spotlight search
+KINDS = {"image": "public.image", "video": "public.movie", "audio": "public.audio", "pdf": "com.adobe.pdf",
+         "text": "public.text", "code": "public.source-code", "folder": "public.folder", "font": "public.font",
+         "doc": "org.openxmlformats.wordprocessingml.document", "slides": "org.openxmlformats.presentationml.presentation",
+         "sheet": "org.openxmlformats.spreadsheetml.sheet", "3d": "public.3d-content"}
+# ~/Library is noise, except OneDrive/Dropbox (CloudStorage) and iCloud Drive (Mobile Documents)
+SKIP = re.compile(r"/(Library/(?!CloudStorage/|Mobile Documents/)|node_modules/|\.git/|\.Trash/|\.cache/|__pycache__/|\.venv/|DerivedData/)")
+
+KIND_EXT = {"image": IMG, "video": VID, "audio": {".mp3", ".wav", ".m4a", ".aif", ".aiff", ".flac", ".ogg"}, "pdf": {".pdf"},
+            "text": {".txt", ".md", ".rtf"}, "code": {".py", ".js", ".ts", ".tsx", ".html", ".css", ".json", ".swift", ".glsl"},
+            "font": {".ttf", ".otf", ".woff", ".woff2"}, "doc": {".docx", ".doc", ".odt", ".pages"}, "slides": {".pptx", ".key", ".odp"},
+            "sheet": {".xlsx", ".csv", ".numbers", ".ods"}, "3d": {".blend", ".obj", ".fbx", ".glb", ".gltf", ".usdz", ".toe"}}
+WIN_SKIP = re.compile(r"\\(AppData|node_modules|\.git|\$Recycle\.Bin|__pycache__|\.venv)\\", re.I)
+
+def windows_search(where, words, name_only):
+    """Everything's es.exe when installed, else the Windows Search index (built in) through PowerShell. None elsewhere."""
+    if not IS_WIN: return None
+    if shutil.which("es"):
+        return subprocess.run(["es", "-path", where, "-n", "2000", *words], capture_output=True, text=True, timeout=60)
+    ps = shutil.which("powershell")
+    if not ps: return None
+    sq = lambda w: w.replace("'", "''")
+    conds = [f"(System.FileName LIKE '%{sq(w)}%'" + ("" if name_only else f" OR CONTAINS(*, '{sq(w)}')") + ")" for w in words]
+    sql = (f"SELECT System.ItemPathDisplay FROM SYSTEMINDEX WHERE SCOPE='file:{sq(where)}'" + "".join(" AND " + c for c in conds))
+    script = ("$c=New-Object -ComObject ADODB.Connection;$c.Open(\"Provider=Search.CollatorDSO;Extended Properties='Application=Windows';\");"
+              "$r=$c.Execute($env:TOKPREP_SQL);while(-not $r.EOF){$r.Fields.Item('System.ItemPathDisplay').Value;$r.MoveNext()}")
+    return subprocess.run([ps, "-NoProfile", "-Command", script], capture_output=True, text=True, timeout=60, env={**os.environ, "TOKPREP_SQL": sql})
+
+def cmd_find(args):
+    """Spotlight (mdfind) search, answered as a short grouped list instead of a raw path dump."""
+    where = opt(args, "--in", str(Path.home())); kind = opt(args, "--kind"); days = opt(args, "--days")
+    name_only = opt(args, "--name", flag=True); limit = int(opt(args, "--limit", "30"))
+    q = " ".join(args)
+    if "kMD" not in q:            # plain words -> a Spotlight predicate: every word in the name (or the content)
+        esc = lambda w: w.replace('"', '\\"')
+        parts = [f'(kMDItemFSName == "*{esc(w)}*"cd' + ("" if name_only else f' || kMDItemTextContent == "{esc(w)}*"cdw') + ")" for w in args]
+        if kind: parts.append(f'kMDItemContentTypeTree == "{KINDS.get(kind, kind)}"')
+        if days: parts.append(f"kMDItemFSContentChangeDate >= $time.today(-{int(days)})")
+        q = " && ".join(parts) or "kMDItemFSName == *"
+    where = os.path.expanduser(where)
+    if IS_MAC and shutil.which("mdfind"):
+        r = subprocess.run(["mdfind", "-onlyin", where, q], capture_output=True, text=True, timeout=60)
+        paths = [p for p in r.stdout.splitlines() if p and (not SKIP.search(p) or "/Library/" in where)]
+    else:
+        r = windows_search(where, args, name_only)
+        if r is None: unavailable("file search (Spotlight / Everything / Windows Search)")
+        paths = [p for p in r.stdout.splitlines() if p.strip() and not WIN_SKIP.search(p)]
+        # kind and age filters done here, the same for both Windows engines
+        if kind: paths = [p for p in paths if (os.path.isdir(p) if kind == "folder" else Path(p).suffix.lower() in KIND_EXT.get(kind, set()))]
+        if days: paths = [p for p in paths if os.path.exists(p) and os.path.getmtime(p) >= time.time() - int(days) * 86400]
+    stats = []
+    for p in paths:
+        try: st = os.stat(p); stats.append((st.st_mtime, p, st.st_size, os.path.isdir(p)))
+        except OSError: pass
+    stats.sort(reverse=True)
+    home = str(Path.home())
+    print(f"{len(stats)} match(es) for: {' '.join(args) or q}" + (f" · kind {kind}" if kind else "") + (f" · last {days} days" if days else "") +
+          (f" · newest {limit} shown" if len(stats) > limit else ""))
+    groups = {}
+    for m, p, s, isdir in stats[:limit]: groups.setdefault(os.path.dirname(p), []).append((m, os.path.basename(p), s, isdir))
+    import time
+    for g, items in groups.items():
+        print(f"\n{g.replace(home, '~')}/")
+        for m, n, s, isdir in items:
+            size = "folder" if isdir else (f"{s / 1048576:.1f} MB" if s > 1048576 else f"{s // 1024} KB")
+            print(f"  {n}  · {size} · {time.strftime('%Y-%m-%d', time.localtime(m))}")
+    if not stats and r.stderr.strip(): print("mdfind: " + r.stderr.strip()[:300])
+
+# ---------------------------------------------------------------- scene-change contact sheet
+def scene_cuts(v, threshold):
+    """[(time, score)] where ffmpeg's scene detector fires; the video is scaled down first so it runs fast."""
+    r = subprocess.run(["ffmpeg", "-hide_banner", "-nostats", "-i", str(v), "-an", "-vf",
+                        f"scale=160:-2,select='gt(scene,{threshold})',metadata=print", "-f", "null", "-"], capture_output=True, text=True)
+    cuts, t = [], None
+    for line in r.stderr.splitlines():
+        m = re.search(r"pts_time:([\d.]+)", line)
+        if m: t = float(m.group(1))
+        m = re.search(r"lavfi\.scene_score=([\d.]+)", line)
+        if m and t is not None: cuts.append((t, float(m.group(1)))); t = None
+    return cuts
+
+def merge_bursts(cuts, min_gap):
+    """Cuts closer than min_gap (strobes, flashes, fast montage) collapse into their strongest cut.
+    Returns (cuts, bursts [(start, end, n)])."""
+    kept, bursts, group = [], [], []
+    for c in sorted(cuts) + [(float("inf"), 0)]:
+        if group and c[0] - group[-1][0] >= min_gap:
+            kept.append(max(group, key=lambda g: g[1]))
+            if len(group) >= 3: bursts.append((group[0][0], group[-1][0], len(group)))
+            group = []
+        group.append(c)
+    return kept, bursts
+
+def scene_frames(v, tmp, max_n=24, threshold=0.3, min_gap=1.0):
+    """One frame per scene (a little after each cut). Returns (frames [(label, path)], scenes [(start, end)], mode, bursts)."""
+    w, h, dur, fps, audio = probe(v)
+    cuts, bursts = merge_bursts(scene_cuts(v, threshold), min_gap)
+    if len(cuts) + 1 > max_n: cuts = sorted(sorted(cuts, key=lambda c: -c[1])[:max_n - 1])
+    starts = [0.0] + [t for t, _ in cuts if t > 0.5]
+    mode = "scene"
+    if len(starts) < 3:           # (almost) one long shot: fall back to even spacing
+        n = min(max_n, 12); starts = [dur * k / n for k in range(n)]; mode = "even"
+    scenes = [(s, starts[i + 1] if i + 1 < len(starts) else dur) for i, s in enumerate(starts)]
+    frames = []
+    for i, (s, e) in enumerate(scenes):
+        t = min(s + min(0.4, (e - s) / 2), max(dur - 0.05, 0)); fr = Path(tmp) / f"{v.stem[:20]}-{i:03d}.jpg"
+        subprocess.run(["ffmpeg", "-v", "error", "-y", "-ss", f"{t:.2f}", "-i", str(v), "-frames:v", "1", "-vf", "scale=480:-2", str(fr)], capture_output=True)
+        if fr.exists(): frames.append((f"#{i + 1} {mmss(s)} ({e - s:.1f}s)", str(fr)))
+    return frames, scenes, mode, bursts
+
+def cmd_scenes(args):
+    threshold = float(opt(args, "--threshold", "0.3")); max_n = int(opt(args, "--max", "24")); min_gap = float(opt(args, "--min", "1.0"))
+    for v in expand(args, VID):
+        w, h, dur, fps, audio = probe(v)
+        d = outdir("scenes", str(v)); tmp = tempfile.mkdtemp(prefix="tokprep-")
+        frames, scenes, mode, bursts = scene_frames(v, tmp, max_n, threshold, min_gap)
+        L = [f"# Scenes: {v.name}", "", f"{mmss(dur)} · {w}×{h} · {fps:.2f} fps · {'audio' if audio else 'no audio'}",
+             f"{len(scenes)} {'scenes (cut detection, threshold ' + str(threshold) + ')' if mode == 'scene' else 'evenly spaced frames — no clear cuts found (one long shot?)'}"]
+        if mode == "scene":
+            lens = [e - s for s, e in scenes]
+            L.append(f"shot length: shortest {min(lens):.1f}s · median {sorted(lens)[len(lens) // 2]:.1f}s · longest {max(lens):.1f}s")
+        if bursts: L.append("rapid cuts / flashes merged: " + ", ".join(f"{mmss(a)}–{mmss(b)} ({n} cuts)" for a, b, n in bursts))
+        L += ["", "## Cuts (start – end)"] + [f"- #{i + 1} {mmss(s)} – {mmss(e)}" for i, (s, e) in enumerate(scenes)]
+        info = image_info([p for _, p in frames])
+        texts = [(f[0].split()[0], i["text"]) for f, i in zip(frames, info) if i.get("text")]
+        if texts: L += ["", "## On-screen text"] + [f"- {n}: {t[:100]}" for n, t in texts[:12]]
+        people = [(f[0].split()[0], i.get("people", 0)) for f, i in zip(frames, info) if i.get("people")]
+        if people: L += ["", "people per scene: " + ", ".join(f"{n}:{c}" for n, c in people)]
+        sheets = [sheet(d / f"sheet-{k}.jpg", 4 if w >= h else 6, chunk) for k, chunk in enumerate([frames[:24], frames[24:48]], 1) if chunk]
+        L += ["", "Images: " + ", ".join(Path(p).name for p, _ in sheets) + " — one frame per scene, labelled #n start (length)."]
+        finish(d, L, sheets, len(frames) * tok_img(w or 1920, h or 1080))
+        shutil.rmtree(tmp, ignore_errors=True)
+
+# ---------------------------------------------------------------- ffmpeg editing of photos and assets
+ASSET_HELP = """tokprep asset <op> <files|folder>... [options] [-o out] [--preview]
+  resize  --max PX | --width W | --height H          photos and videos, never upscales
+  convert --to jpg|png|avif|heic|gif|mp4|mov|webm|m4a|mp3|wav
+  crop    --aspect 16:9 | --box W:H:X:Y              centred crop by aspect, or exact box
+  web     [--max 2000 (photo) / 1080 (video)] [--mute]   web-ready: jpg q≈85 or H.264 faststart, metadata stripped
+  trim    --from T --to T                            seconds or mm:ss (re-encoded, frame-accurate)
+  gif     [--fps 12] [--width 480]                   video -> gif with an optimised palette
+  mp4                                                gif/mov -> H.264 mp4
+  poster  [--at T]                                   one frame as jpg (default: the most representative frame)
+  audio   [--to m4a|mp3|wav]                         extract the soundtrack
+  mute                                               drop the audio (no re-encode)
+  speed   --x 2                                      faster/slower, audio kept in pitch
+  rotate  --deg 90|180|270 | --flip h|v
+  grade   [--brightness 0.05] [--contrast 1.1] [--saturation 1.2] [--gamma 1.0] [--lut file.cube]
+Outputs never overwrite: they go to -o (a folder, or a file for one input) or tokprep's output folder."""
+
+def cmd_asset(args):
+    if not args or args[0] not in "resize convert crop web trim gif mp4 poster audio mute speed rotate grade".split(): print(ASSET_HELP); sys.exit(2)
+    op = args.pop(0); out = opt(args, "-o"); preview = opt(args, "--preview", flag=True)
+    o = {k: opt(args, "--" + k) for k in "max width height to aspect box from at fps x deg flip brightness contrast saturation gamma lut".split()}
+    o["mute"] = opt(args, "--mute", flag=True)
+    files = expand(args, IMG | VID | {".gif", ".m4a", ".mp3", ".wav", ".aif", ".aiff"})
+    single_file = out and Path(out).suffix and len(files) == 1
+    d = Path(out).parent if single_file else Path(out) if out else outdir("asset", f"{op}-{files[0].stem if files else 'none'}")
+    d.mkdir(parents=True, exist_ok=True)
+    rows, tiles = [], []
+    for f in files:
+        w, h, dur, fps, audio = probe(f)
+        vid = f.suffix.lower() in VID | {".gif"} and dur > 0.2
+        ext = f.suffix.lower(); a, vf = [], []
+        if op == "resize":
+            if o["max"]: m = int(o["max"]); vf.append(f"scale='if(gte(iw,ih),min(iw,{m}),-2)':'if(gte(iw,ih),-2,min(ih,{m}))'")
+            elif o["width"]: vf.append(f"scale='min(iw,{o['width']})':-2")
+            elif o["height"]: vf.append(f"scale=-2:'min(ih,{o['height']})'")
+        elif op == "convert":
+            ext = "." + (o["to"] or "jpg").lstrip(".")
+            if ext == ".heic":
+                if not IS_MAC: unavailable("HEIC export (macOS sips)")
+                target = free_path(d / f"{f.stem}-convert{ext}"); subprocess.run(["sips", "-s", "format", "heic", str(f), "--out", str(target)], capture_output=True)
+                rows.append((f, target)); continue
+            if ext == ".avif": a += ["-c:v", "libsvtav1", "-crf", "30", "-pix_fmt", "yuv420p"]
+            if ext == ".webp": sys.exit("this ffmpeg build has no WebP encoder (libwebp); use avif or jpg, or `brew install webp` for cwebp")
+        elif op == "crop":
+            if o["box"]: vf.append("crop=" + o["box"])
+            else:
+                aw, ah = map(float, (o["aspect"] or "1:1").split(":"))
+                vf.append(f"crop='min(iw,ih*{aw}/{ah})':'min(ih,iw*{ah}/{aw})'")
+        elif op == "web":
+            m = int(o["max"] or (1080 if vid else 2000))
+            vf.append(f"scale='if(gte(iw,ih),min(iw,{m}),-2)':'if(gte(iw,ih),-2,min(ih,{m}))'")
+            a += ["-map_metadata", "-1"]
+            if vid: ext = ".mp4"; a += ["-c:v", "libx264", "-preset", "slow", "-crf", "23", "-pix_fmt", "yuv420p", "-movflags", "+faststart", "-tag:v", "avc1"] + (["-an"] if o["mute"] else ["-c:a", "aac", "-b:a", "128k"])
+            else: ext = ".jpg"; a += ["-q:v", "3"]
+        elif op == "trim":
+            a = ["-c:v", "libx264", "-crf", "18", "-pix_fmt", "yuv420p", "-c:a", "aac"]
+        elif op == "gif":
+            ext = ".gif"; fr, wd = o["fps"] or "12", o["width"] or "480"
+            vf.append(f"fps={fr},scale={wd}:-2:flags=lanczos,split[a][b];[a]palettegen=stats_mode=diff[p];[b][p]paletteuse=dither=bayer:bayer_scale=4")
+        elif op == "mp4":
+            ext = ".mp4"; vf.append("scale=trunc(iw/2)*2:trunc(ih/2)*2"); a += ["-c:v", "libx264", "-crf", "20", "-pix_fmt", "yuv420p", "-movflags", "+faststart"]
+        elif op == "poster":
+            ext = ".jpg"; a += ["-frames:v", "1", "-q:v", "2"]
+            if not o["at"]: vf.append("thumbnail=300")
+        elif op == "audio":
+            ext = "." + (o["to"] or "m4a"); a += ["-vn"] + (["-c:a", "aac", "-b:a", "192k"] if ext == ".m4a" else [])
+        elif op == "mute":
+            a += ["-an", "-c:v", "copy"]
+        elif op == "speed":
+            x = float(o["x"] or 2); vf.append(f"setpts=PTS/{x}")
+            tempo = []; r = x
+            while r > 2: tempo.append("atempo=2.0"); r /= 2
+            while r < 0.5: tempo.append("atempo=0.5"); r /= 0.5
+            tempo.append(f"atempo={r:.4f}")
+            if audio: a += ["-af", ",".join(tempo)]
+        elif op == "rotate":
+            vf.append({"90": "transpose=1", "180": "transpose=1,transpose=1", "270": "transpose=2"}.get(o["deg"] or "", "")
+                      or {"h": "hflip", "v": "vflip"}.get(o["flip"] or "", "transpose=1"))
+        elif op == "grade":
+            eq = ":".join(f"{k}={o[k]}" for k in ("brightness", "contrast", "saturation", "gamma") if o[k])
+            if eq: vf.append("eq=" + eq)
+            if o["lut"]: vf.append(f"lut3d='{o['lut']}'")
+        target = free_path(Path(out) if single_file else d / f"{f.stem}-{op}{ext}")
+        pre = []
+        if op == "trim":
+            pre = (["-ss", o["from"]] if o["from"] else []) + (["-to", o["to"]] if o["to"] else [])
+        if op == "poster" and o["at"]: pre = ["-ss", o["at"]]
+        flt = (["-filter_complex" if "[" in ";".join(vf) else "-vf", ",".join(vf)] if vf else [])
+        if not vid and ext in (".jpg", ".jpeg") and "-q:v" not in a: a += ["-q:v", "2"]
+        if not vid and op not in ("poster",): a = ["-frames:v", "1"] + a if ext not in (".gif",) else a
+        ff(*pre, "-i", f, *flt, *a, target)
+        rows.append((f, target))
+        if preview and len(tiles) < 12:
+            src_t, dst_t = (f, target)
+            if vid or target.suffix.lower() in VID | {".gif"}:
+                src_t = Path(tempfile.mkdtemp()) / "a.jpg"; ff("-ss", f"{dur / 2:.2f}", "-i", f, "-frames:v", "1", src_t)
+                d2 = probe(target)[2]; dst_t = Path(tempfile.mkdtemp()) / "b.jpg"; ff("-ss", f"{d2 / 2:.2f}", "-i", target, "-frames:v", "1", dst_t)
+            if Path(dst_t).suffix.lower() in IMG: tiles += [(f"{f.stem[:14]} before", str(src_t)), (f"{f.stem[:14]} after", str(dst_t))]
+    for f, t in rows:
+        w0, h0, d0 = probe(f)[:3]; w1, h1, d1 = probe(t)[:3]
+        desc = lambda w, h, dur, p: ", ".join(x for x in [f"{w}×{h}" if w else "", mmss(dur) if dur > 0.2 else "", kb(p)] if x)
+        print(f"{f.name} ({desc(w0, h0, d0, f)}) -> {t} ({desc(w1, h1, d1, t)})")
+    if tiles:
+        p, tk = sheet(d / "preview.jpg", 4, tiles); print(f"preview: {p} (~{tk:,} tokens)")
+
+# ---------------------------------------------------------------- jobs: temporary files live and die with the asset they make
+# A job is one asset being made. Everything temporary goes in its work folder (tokprep's own outputs land there
+# by themselves while the job is open); `job deliver` moves the final file out; `job done`, after the person
+# approves the final, deletes the work folder and every file registered with `job track`. Finals are never touched.
+JOBS = Path.home() / ".cache" / "tokprep" / "jobs"
+CURRENT = JOBS / "CURRENT"
+
+def du(p):
+    p = Path(p)
+    if p.is_symlink() or p.is_file(): return p.lstat().st_size
+    return sum(f.lstat().st_size for f in p.rglob("*") if f.is_file() or f.is_symlink()) if p.is_dir() else 0
+
+def human(n): return f"{n / 1073741824:.2f} GB" if n > 1073741824 else f"{n / 1048576:.1f} MB" if n > 1048576 else f"{n // 1024} KB"
+
+def job_current():
+    try: jid = CURRENT.read_text().strip()
+    except OSError: return None
+    meta = JOBS / jid / "meta.json"
+    return json.loads(meta.read_text()) if meta.exists() else None
+
+def job_save(m): (JOBS / m["id"] / "meta.json").write_text(json.dumps(m, indent=1))
+
+def job_work():
+    m = job_current()
+    return Path(m["work"]) if m else None
+
+def inside(p, root):
+    try: Path(p).resolve().relative_to(Path(root).resolve()); return True
+    except ValueError: return False
+
+def removable(p, m):
+    """Why a path may NOT be deleted, or None when it may."""
+    p = Path(p).resolve(); home = Path.home().resolve()
+    if not p.exists() and not p.is_symlink(): return "already gone"
+    if any(inside(f, p) or inside(p, f) for f in m["finals"]): return "is or holds a delivered final"
+    if inside(p, m["work"]): return None
+    if not inside(p, home) and not str(p).startswith(("/private/tmp/", "/tmp/", "/private/var/folders/")): return "outside your home folder"
+    if p == home or p.parent == home or p in {Path(m.get("dest") or "/nonexistent").resolve()}: return "a top-level or destination folder"
+    if p.stat().st_mtime < m["started"] - 60 and not p.is_dir(): return "older than the job (not made by it)"
+    return None
+
+def cmd_job(args):
+    sub = args.pop(0) if args else "status"
+    m = job_current()
+    if sub == "start":
+        dest = opt(args, "--dest"); name = " ".join(args) or "asset"
+        if m: print(f"job already open: {m['name']} ({m['work']}). Finish it with `tokprep job done` or `tokprep job abandon` first."); sys.exit(1)
+        jid = re.sub(r"[^\w.-]+", "-", name)[:40] + time.strftime("-%Y%m%d-%H%M%S")
+        work = JOBS / jid / "work"; work.mkdir(parents=True)
+        m = {"id": jid, "name": name, "started": time.time(), "work": str(work), "dest": str(Path(dest).expanduser()) if dest else None, "tracked": [], "finals": []}
+        job_save(m); CURRENT.write_text(jid)
+        print(f"job '{name}' open. Put every temporary file in:\n{work}\n(tokprep outputs go there by themselves until `tokprep job done`.)")
+    elif sub == "dir":
+        if not m: sys.exit("no job open")
+        print(m["work"])
+    elif sub == "track":
+        if not m: sys.exit("no job open: `tokprep job start <name>` first")
+        added = []
+        for a in args:
+            p = Path(a).expanduser().resolve()
+            why = removable(p, m)
+            if why and why != "already gone": print(f"not tracked: {p} — {why}"); continue
+            if str(p) not in m["tracked"]: m["tracked"].append(str(p)); added.append(p)
+        job_save(m); print(f"tracking {len(added)} more temporary path(s); {len(m['tracked'])} in all")
+    elif sub == "deliver":
+        if not m: sys.exit("no job open")
+        to = opt(args, "--to") or m.get("dest"); name = opt(args, "--name")
+        if not to: sys.exit("where should the final go? pass --to <folder> (or start the job with --dest)")
+        for a in args:
+            src = Path(a).expanduser().resolve()
+            target = free_path(Path(to).expanduser() / (name or src.name)); target.parent.mkdir(parents=True, exist_ok=True)
+            (shutil.move if inside(src, m["work"]) else shutil.copy2)(str(src), str(target))
+            m["finals"].append(str(target.resolve()))
+            print(f"final: {target} ({human(du(target))})")
+        job_save(m)
+    elif sub == "status":
+        if not m: print("no job open"); return
+        tracked = [t for t in m["tracked"] if Path(t).exists()]
+        temp = du(m["work"]) + sum(du(t) for t in tracked)
+        line = f"job {m['name']} · {human(temp)} temporary · {len(m['finals'])} final(s)"
+        if "--line" in args: print(line); return
+        print(line + f"\nwork: {m['work']}\nopen for {int((time.time() - m['started']) / 60)} min")
+        for t in tracked: print(f"  tracked: {t} ({human(du(t))})")
+        for f in m["finals"]: print(f"  final:   {f}")
+    elif sub in ("done", "abandon"):
+        if not m: print("no job open"); return
+        dry, force = opt(args, "--dry-run", flag=True), opt(args, "--force", flag=True)
+        if sub == "done" and not m["finals"] and not force:
+            sys.exit("no final delivered yet: `tokprep job deliver <file> --to <folder>` first (or --force to delete everything)")
+        gone, kept, freed = [], [], 0
+        for p in [m["work"]] + m["tracked"]:
+            why = removable(p, m)
+            if why == "already gone": continue
+            if why: kept.append(f"{p} — {why}"); continue
+            size = du(p); gone.append((p, size)); freed += size
+            if not dry: shutil.rmtree(p) if Path(p).is_dir() and not Path(p).is_symlink() else Path(p).unlink()
+        print(("would delete" if dry else "deleted") + f" {len(gone)} temporary path(s), {human(freed)}" + (" (dry run)" if dry else ""))
+        for p, s in gone[:15]: print(f"  - {p.replace(str(Path.home()), '~')} ({human(s)})")
+        for k in kept: print(f"  kept: {k}")
+        for f in m["finals"]: print(f"  final kept: {f}")
+        if not dry:
+            m.update(closed=time.time(), freed=freed, outcome=sub); job_save(m); CURRENT.unlink(missing_ok=True)
+            print(f"TOKPREP_JOB_{sub.upper()} name={json.dumps(m['name'])} freed={freed}")
+    elif sub == "list":
+        cur = m["id"] if m else None
+        for meta in sorted(JOBS.glob("*/meta.json")):
+            j = json.loads(meta.read_text())
+            state = "open" if j["id"] == cur else f"{j.get('outcome', 'stale')}" + (f", freed {human(j['freed'])}" if j.get("freed") else "")
+            print(f"{time.strftime('%Y-%m-%d', time.localtime(j['started']))}  {j['name']}  ({state})" + (f"  {human(du(j['work']))} left" if Path(j["work"]).exists() else ""))
+    else:
+        sys.exit("tokprep job start <name> [--dest dir] | dir | track <paths> | deliver <file> [--to dir] [--name n] | status [--line] | done [--dry-run] | abandon | list")
+
+def cmd_clean(args):
+    """Delete tokprep's own prep outputs (summaries, sheets, frames) older than --days (default 7)."""
+    days = float(opt(args, "--days", "7")); dry = opt(args, "--dry-run", flag=True)
+    base = Path(os.environ.get("TOKPREP_OUT", Path.home() / ".cache" / "tokprep")); cutoff = time.time() - days * 86400
+    old = [d for d in base.iterdir() if d.is_dir() and d.name != "jobs" and d.stat().st_mtime < cutoff] if base.exists() else []
+    freed = sum(du(d) for d in old)
+    if not dry:
+        for d in old: shutil.rmtree(d, ignore_errors=True)
+    print(("would free " if dry else "freed ") + f"{human(freed)} in {len(old)} prep folder(s) older than {days:g} days")
+
+if __name__ == "__main__":
+    cmds = {"web": cmd_web, "media": cmd_media, "file": cmd_file, "peek": cmd_peek, "grep": cmd_grep, "ocr": cmd_ocr, "faces": cmd_faces,
+            "cutout": cmd_cutout, "key": cmd_key, "find": cmd_find, "scenes": cmd_scenes, "asset": cmd_asset,
+            "job": cmd_job, "clean": cmd_clean}
+    if len(sys.argv) < 2 or sys.argv[1] not in cmds or (len(sys.argv) < 3 and sys.argv[1] not in ("asset", "job", "clean")): print(__doc__); sys.exit(2)
+    cmds[sys.argv[1]](sys.argv[2:])
