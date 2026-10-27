@@ -1,0 +1,6 @@
+{
+  "name": "cyberspezie",
+  "owner": { "name": "cyberspezie" },
+  "description": "Claude Code plugins by cyberspezie.",
+  "plugins": [{ "name": "token-saver", "source": "./" }]
+}

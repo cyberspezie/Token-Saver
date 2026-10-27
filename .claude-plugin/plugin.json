@@ -1,0 +1,1 @@
+{ "name": "token-saver", "version": "0.4.0", "description": "Claude Code plugin that saves tokens: your computer does the heavy reading locally (OCR, faces, video scene sheets, file search, file outlines, ffmpeg edits) and Claude reads a one-page summary instead of raw images, videos and long files. macOS and Windows." }

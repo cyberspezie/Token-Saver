@@ -16,7 +16,7 @@ It works silently. There is no status line and no pop-ups: it only changes what 
 At the prompt of a Claude Code terminal session:
 
 ```
-/plugin install token-saver --marketplace cyberspezie/token-saver
+/plugin install token-saver --marketplace cyberspezie/Token-Saver
 ```
 
 Answer `y` to add the marketplace, then pick the **user** scope so it works in every project.
@@ -24,10 +24,10 @@ Answer `y` to add the marketplace, then pick the **user** scope so it works in e
 From a shell:
 
 ```
-claude plugin install token-saver --marketplace cyberspezie/token-saver
+claude plugin install token-saver --marketplace cyberspezie/Token-Saver
 ```
 
-In the Claude desktop app, where `/plugin` does not run: click **+** next to the prompt box, then **Plugins**, **Add marketplace** with `cyberspezie/token-saver`, then **Add plugin**.
+In the Claude desktop app, where `/plugin` does not run: click **+** next to the prompt box, then **Plugins**, **Add marketplace** with `cyberspezie/Token-Saver`, then **Add plugin**.
 
 ## What it does inside Claude Code
 

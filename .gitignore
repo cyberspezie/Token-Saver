@@ -1,0 +1,11 @@
+# written by Claude Code when it loads the plugin (types for editors)
+.claude-plugin/types/
+tsconfig.json
+# made by the OS, editors and tools
+.DS_Store
+*~
+*.swp
+*.log
+__pycache__/
+.mcpb-cache/
+# tokprep's own outputs and the compiled Vision helper live in ~/.cache/tokprep, never here
