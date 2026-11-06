@@ -46,7 +46,7 @@ Claude runs these itself; you don't need to.
 | --- | --- | --- |
 | `tokprep ocr <images>` | text recognition | the text |
 | `tokprep faces <images>` | face boxes and capture quality | one line per image + a sheet of face crops |
-| `tokprep media <images/videos/folder>` | size, text, faces, people, scene changes, Whisper transcript | summary + 1–2 contact sheets |
+| `tokprep media <images/videos/folder>` | size, text, faces, people, scene changes, transcript (macOS 26+) | summary + 1–2 contact sheets |
 | `tokprep scenes <video>` | one frame per scene change (flashes merged), cut list, shot lengths | summary + 1 sheet |
 | `tokprep cutout <image/video> --bg transparent\|green\|#hex\|bg.jpg` | removes the background / makes a green screen | coverage % + a before/after sheet |
 | `tokprep key <image/video>` | removes an existing green/blue screen (ffmpeg chromakey) | one line + a sheet |
@@ -69,7 +69,7 @@ Each command uses the Apple tool on macOS, the Windows alternative when the mach
 | File search | Spotlight | Everything (`es.exe`) if installed, else Windows Search | Claude's own search |
 | Contact sheets, scenes, edits | CoreGraphics + ffmpeg | ffmpeg | ffmpeg |
 | Word / PDF text | `textutil` / PDFKit | `.docx`/`.odt` directly; `pdftotext` if installed | Claude reads the PDF |
-| Transcripts | Whisper CLI, if installed | Whisper CLI, if installed | none |
+| Video transcripts | Apple SpeechAnalyzer, macOS 26+ (system language; set `TOKPREP_SPEECH_LANG=en-US` for another) | none | none |
 
 The Windows path is written against the Windows APIs and has not yet been run on a Windows machine. Issues are welcome.
 
@@ -80,7 +80,7 @@ The Windows path is written against the Windows APIs and has not yet been run on
 - Node.js 22+ and Edge or Chrome, for page checks.
 - macOS: the Xcode command-line tools (`swiftc`); the Vision helper compiles itself on first use into `~/.cache/tokprep/`.
 - For graphify: `uv` (recommended), `pipx`, or Python 3.10+ with `pip`.
-- Optional: `ctags`, a Whisper CLI (`whisper-cpp`), `rembg`, `pdftotext`, Everything.
+- Optional: `ctags`, `rembg`, `pdftotext`, Everything.
 
 ## Privacy and safety
 

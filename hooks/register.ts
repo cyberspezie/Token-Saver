@@ -81,7 +81,7 @@ export const register: Register = on => {
     if (VIDEO.test(path)) {
       nudged.add(path)
       return { deny: `Prep video locally first: ${tokprep($.plugin.root)} scenes "${path}" (one frame per scene change on one sheet, cut list, on-screen text) ` +
-        `or ${tokprep($.plugin.root)} media "${path}" (adds the Whisper transcript). Read the summary.md it prints. ${FALLBACK} ${again}` }
+        `or ${tokprep($.plugin.root)} media "${path}" (adds people per frame and, on macOS 26+, the transcript; several files at once). Read the summary.md it prints. ${FALLBACK} ${again}` }
     }
     if (e.offset === undefined && e.limit === undefined && e.pages === undefined) {
       const st = await $.fs.stat(path).catch(() => undefined)

@@ -1,6 +1,6 @@
 ---
 name: token-saver
-description: Local Mac tools that do the heavy reading before Claude does - text in images (OCR), face detection, green screen / background removal and chroma key, Spotlight file search, one-frame-per-scene video contact sheets, Whisper transcripts, and ffmpeg edits of photos, videos, gifs and audio (resize, convert, crop, web export, trim, gif, poster frame, speed, rotate, colour grade). Use whenever a task involves looking at images, screenshots or video, finding files on this Mac, cutting out a subject or replacing a background, or editing media assets.
+description: Local Mac tools that do the heavy reading before Claude does - text in images (OCR), face detection, green screen / background removal and chroma key, Spotlight file search, one-frame-per-scene video contact sheets, and ffmpeg edits of photos, videos, gifs and audio (resize, convert, crop, web export, trim, gif, poster frame, speed, rotate, colour grade). Use whenever a task involves looking at images, screenshots or video, finding files on this Mac, cutting out a subject or replacing a background, or editing media assets.
 ---
 
 # token-saver: `tokprep`
@@ -13,7 +13,7 @@ Each command uses the Apple tool on macOS (Vision, Spotlight, sips, PDFKit). Els
 | --- | --- |
 | Words in a screenshot, photo or scan | `tokprep ocr <img|folder> [--fast]` |
 | Faces: how many, where, how sharp | `tokprep faces <img|folder>`: boxes in pixels, quality 0–1, one sheet of crops |
-| Overview of photos or videos | `tokprep media <files|folder>`: size, text, faces, people, scenes, Whisper transcript |
+| Overview of photos or videos | `tokprep media <files|folder>`: size, text, faces, people, scenes, transcript (macOS 26+, Apple SpeechAnalyzer) |
 | What happens in a video | `tokprep scenes <video> [--threshold 0.3] [--max 24] [--min 1.0]`: cut list, shot lengths, one frame per scene |
 | Cut a subject out / green screen | `tokprep cutout <img|video|folder> --bg transparent|green|blue|#hex|bg.jpg [--mode auto|subject|person] -o <dir>` |
 | Remove an existing green/blue screen | `tokprep key <img|video> [--color auto] [--similarity 0.12] [--bg transparent|bg.jpg] -o <dir>` |

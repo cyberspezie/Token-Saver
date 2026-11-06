@@ -26,7 +26,7 @@
 
 Results go to $TOKPREP_OUT or ~/.cache/tokprep/<name>/: summary.md plus sheet-1.jpg / sheet-2.jpg.
 """
-import hashlib, json, os, re, shutil, subprocess, sys, tempfile, time, zipfile, html as htmllib
+import hashlib, json, os, platform, re, shutil, subprocess, sys, tempfile, time, zipfile, html as htmllib
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent.parent / "lib"
@@ -185,19 +185,30 @@ def ffprobe(p):
     j = json.loads(r.stdout or "{}"); v = next((s for s in j.get("streams", []) if s.get("codec_type") == "video"), {})
     return float(j.get("format", {}).get("duration", 0) or 0), v.get("width", 0), v.get("height", 0), any(s.get("codec_type") == "audio" for s in j.get("streams", []))
 
-def transcribe(p, tmp):
-    for exe in ("whisper-cli", "whisper-cpp", "mlx_whisper", "whisper"):
-        if shutil.which(exe): break
-    else: return None
-    wav = Path(tmp) / (p.stem + ".wav")
-    subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", str(p), "-ar", "16000", "-ac", "1", str(wav)], check=True)
-    if exe in ("whisper-cli", "whisper-cpp"):
-        model = os.environ.get("TOKPREP_WHISPER_MODEL", str(Path.home() / ".cache/whisper/ggml-base.bin"))
-        r = subprocess.run([exe, "-m", model, "-nt", "-l", "auto", "-f", str(wav)], capture_output=True, text=True)
-    else:
-        r = subprocess.run([exe, str(wav), "--output-format", "txt", "--output-dir", tmp], capture_output=True, text=True)
-        r.stdout = (Path(tmp) / (wav.stem + ".txt")).read_text() if (Path(tmp) / (wav.stem + ".txt")).exists() else r.stdout
-    return re.sub(r"\s+", " ", r.stdout).strip()
+def speech():
+    """The SpeechAnalyzer helper (on-device transcripts), macOS 26+ only. None elsewhere: no transcript, no message."""
+    if not IS_MAC or not shutil.which("swiftc"): return None
+    try:
+        if int(platform.mac_ver()[0].split(".")[0]) < 26: return None
+    except ValueError: return None
+    exe = Path.home() / ".cache" / "tokprep" / "bin" / "tokspeech"
+    src = HERE / "tokspeech.swift"
+    exe.parent.mkdir(parents=True, exist_ok=True)
+    if not exe.exists() or exe.stat().st_mtime < src.stat().st_mtime:
+        if subprocess.run(["swiftc", "-O", str(src), "-o", str(exe)], capture_output=True).returncode: return None
+    return str(exe)
+
+def transcribe(v, tmp):
+    """(text, note): text is None when there is no transcript; note says why, or is None when there is nothing to say."""
+    s = speech()
+    if not s: return None, None
+    wav = Path(tmp) / (v.stem + ".wav")
+    subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", str(v), "-ar", "16000", "-ac", "1", str(wav)], check=True)
+    lang = os.environ.get("TOKPREP_SPEECH_LANG")       # e.g. en-US; default: the system language
+    r = subprocess.run([s, str(wav)] + ([lang] if lang else []), capture_output=True, text=True)
+    if r.returncode == 3: return None, None
+    if r.returncode: return None, "transcript failed: " + (r.stderr.strip().splitlines() or ["unknown error"])[-1][:160]
+    return re.sub(r"\s+", " ", r.stdout).strip(), None
 
 def cmd_media(args):
     files = []
@@ -237,11 +248,10 @@ def cmd_media(args):
             if texts: L.append("- on-screen text: " + " | ".join(t[:80] for t in texts[:6]))
             L.append(f"- most people in one frame: {people}")
         if audio:
-            tr = transcribe(v, tmp)
-            if tr is None: L.append("- transcript: not made (no local Whisper installed)")
-            elif not re.sub(r"[\[(][^\])]*[\])]|\W", "", tr):     # only [Music] / (applause) tags
-                L.append("- audio: no speech (" + (re.search(r"[\[(]([^\])]*)", tr).group(1) if re.search(r"[\[(]", tr) else "silence") + ")")
-            else:
+            tr, note = transcribe(v, tmp)
+            if note: L.append("- " + note)
+            elif tr == "": L.append("- audio: no speech recognised")
+            elif tr:
                 before += tok_text(tr) * 2      # raw .srt/.vtt with timestamps is about twice the plain text
                 (d / f"{v.stem}.transcript.txt").write_text(tr)
                 L.append(f"- transcript ({tok_text(tr):,} tokens, saved next to this file): “{tr[:400]}…”")
