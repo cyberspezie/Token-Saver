@@ -22,6 +22,8 @@
   tokprep job done [--dry-run]            after the final is approved: delete everything temporary, report space freed
   tokprep clean [--days 7]                delete old prep outputs (summaries, sheets) outside jobs
 
+  tokprep graphify status | setup [--force]   graphify (code knowledge graph, PyPI graphifyy): check, or install CLI + Claude skill
+
 Results go to $TOKPREP_OUT or ~/.cache/tokprep/<name>/: summary.md plus sheet-1.jpg / sheet-2.jpg.
 """
 import hashlib, json, os, re, shutil, subprocess, sys, tempfile, time, zipfile, html as htmllib
@@ -920,9 +922,57 @@ def cmd_clean(args):
         for d in old: shutil.rmtree(d, ignore_errors=True)
     print(("would free " if dry else "freed ") + f"{human(freed)} in {len(old)} prep folder(s) older than {days:g} days")
 
+GRAPHIFY_STAMP = Path.home() / ".cache" / "tokprep" / "graphify-setup.json"
+
+def find_tool(name):
+    """A CLI on PATH or in the usual install folders (a hook's PATH is often short)."""
+    win = os.name == "nt"
+    dirs = [Path.home() / ".local" / "bin", Path("/opt/homebrew/bin"), Path("/usr/local/bin"), Path.home() / ".cargo" / "bin"]
+    if win: dirs += [Path(os.environ.get("APPDATA", "")) / "Python" / "Scripts"]
+    hit = shutil.which(name)
+    if hit: return hit
+    for d in dirs:
+        for c in ([d / f"{name}.exe", d / f"{name}.cmd"] if win else [d / name]):
+            if c.is_file(): return str(c)
+    return None
+
+def cmd_graphify(args):
+    """status: is graphify there. setup: install the CLI (uv, else pipx, else pip --user) and its Claude Code skill.
+    A failed setup is not retried for a day unless --force."""
+    sub = args[0] if args else "status"; force = opt(args, "--force", flag=True)
+    skill = Path.home() / ".claude" / "skills" / "graphify" / "SKILL.md"
+    exe = find_tool("graphify")
+    if sub == "status":
+        ver = subprocess.run([exe, "--version"], capture_output=True, text=True).stdout.strip() if exe else ""
+        print(f"{ver or 'graphify'} at {exe}, skill {'installed' if skill.exists() else 'missing'}" if exe else "graphify missing: tokprep graphify setup")
+        return
+    if sub != "setup": sys.exit("tokprep graphify status | setup [--force]")
+    if exe and skill.exists(): print(f"graphify ready at {exe}"); return
+    if not force and GRAPHIFY_STAMP.exists() and time.time() - GRAPHIFY_STAMP.stat().st_mtime < 86400:
+        print("graphify setup failed less than a day ago; tokprep graphify setup --force retries"); return
+    log = []
+    if not exe:
+        tries = []
+        if find_tool("uv"): tries.append([find_tool("uv"), "tool", "install", "graphifyy"])
+        if find_tool("pipx"): tries.append([find_tool("pipx"), "install", "graphifyy"])
+        tries.append([sys.executable, "-m", "pip", "install", "--user", "graphifyy"])
+        for t in tries:
+            r = subprocess.run(t, capture_output=True, text=True)
+            log.append(f"{' '.join(Path(t[0]).name if i == 0 else a for i, a in enumerate(t))}: exit {r.returncode}")
+            exe = find_tool("graphify")
+            if r.returncode == 0 and exe: break
+    if exe and not skill.exists():
+        r = subprocess.run([exe, "install", "--platform", "claude"], capture_output=True, text=True)
+        log.append(f"graphify install --platform claude: exit {r.returncode}")
+    ok = bool(exe) and skill.exists()
+    GRAPHIFY_STAMP.parent.mkdir(parents=True, exist_ok=True)
+    if ok: GRAPHIFY_STAMP.unlink(missing_ok=True)
+    else: GRAPHIFY_STAMP.write_text(json.dumps({"at": time.time(), "log": log}))
+    print(("graphify ready at " + exe) if ok else "graphify NOT AVAILABLE on this machine (needs uv, pipx or Python 3.10+ pip): " + "; ".join(log))
+
 if __name__ == "__main__":
     cmds = {"web": cmd_web, "media": cmd_media, "file": cmd_file, "peek": cmd_peek, "grep": cmd_grep, "ocr": cmd_ocr, "faces": cmd_faces,
             "cutout": cmd_cutout, "key": cmd_key, "find": cmd_find, "scenes": cmd_scenes, "asset": cmd_asset,
-            "job": cmd_job, "clean": cmd_clean}
-    if len(sys.argv) < 2 or sys.argv[1] not in cmds or (len(sys.argv) < 3 and sys.argv[1] not in ("asset", "job", "clean")): print(__doc__); sys.exit(2)
+            "job": cmd_job, "clean": cmd_clean, "graphify": cmd_graphify}
+    if len(sys.argv) < 2 or sys.argv[1] not in cmds or (len(sys.argv) < 3 and sys.argv[1] not in ("asset", "job", "clean", "graphify")): print(__doc__); sys.exit(2)
     cmds[sys.argv[1]](sys.argv[2:])

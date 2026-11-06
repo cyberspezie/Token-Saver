@@ -36,6 +36,7 @@ In the Claude desktop app, where `/plugin` does not run: click **+** next to the
 - **A `find` over the whole home folder** is pointed to the system's search index (Spotlight, Windows Search) instead.
 - **Media jobs:** when Claude makes an asset for you (a video edit, a cutout, a gif), its temporary files go in one job folder. Once you approve the final version, they are deleted and the conversation is compacted, which frees both disk space and context.
 - **A skill** tells Claude which command fits which task.
+- **Code navigation through [graphify](https://github.com/Graphify-Labs/graphify).** On session start, if graphify is missing, the plugin installs it in the background (`uv tool install graphifyy`, else `pipx`, else `pip --user`) and registers its Claude Code skill. Claude then queries the project's knowledge graph (`graphify query`, `path`, `explain`) before grepping or reading source files, and runs `graphify update .` after code edits. Build a graph once per project with `/graphify .`. A failed install is retried after a day, or at once with `tokprep graphify setup --force`.
 
 ## The `tokprep` commands
 
@@ -53,6 +54,7 @@ Claude runs these itself; you don't need to.
 | `tokprep asset <op> <files>` | ffmpeg edits: resize, convert, crop, web export, trim, gif, poster frame, audio, mute, speed, rotate, colour grade | one line per file: before → after |
 | `tokprep web <url or file.html>` | headless Edge/Chrome at desktop and phone widths: overflow, broken or oversized images, tiny text, console errors | summary + sliced screenshots on a sheet |
 | `tokprep file <path>` / `peek` / `grep` | outline of a long file (code, HTML, Markdown, Word, PDF, epub, subtitles); views with long lines clipped | one page / the clipped lines |
+| `tokprep graphify status\|setup` | checks graphify, or installs the CLI and its Claude Code skill | one line |
 | `tokprep job start\|deliver\|done` | temporary files of an asset; deleted after you approve the final | status lines |
 
 ## macOS, Windows, and machines without the tools
@@ -77,6 +79,7 @@ The Windows path is written against the Windows APIs and has not yet been run on
 - `ffmpeg` and Python 3.
 - Node.js 22+ and Edge or Chrome, for page checks.
 - macOS: the Xcode command-line tools (`swiftc`); the Vision helper compiles itself on first use into `~/.cache/tokprep/`.
+- For graphify: `uv` (recommended), `pipx`, or Python 3.10+ with `pip`.
 - Optional: `ctags`, a Whisper CLI (`whisper-cpp`), `rembg`, `pdftotext`, Everything.
 
 ## Privacy and safety

@@ -24,29 +24,40 @@ const isWindows = (root: string) => /^[A-Za-z]:[\\/]/.test(root)
 const tokprep = (root: string) => isWindows(root) ? `python "${root}\\bin\\tokprep"` : `"${root}/bin/tokprep"`
 const FALLBACK = 'If tokprep answers NOT AVAILABLE on this machine, do it directly as you would without it.'
 
-// The open job, as one line, from tokprep itself (it owns the job files). The mod draws no status line or notices.
-async function refreshJob($: EngineInterface) {
+// Runs tokprep with the first Python that works; undefined if none does.
+async function runTokprep($: EngineInterface, args: string[]) {
   const script = isWindows($.plugin.root) ? `${$.plugin.root}\\bin\\tokprep` : `${$.plugin.root}/bin/tokprep`
   const pythons = isWindows($.plugin.root) ? [['py', '-3'], ['python']] : [['/usr/bin/python3', '-I'], ['python3']]
-  let line: string | undefined
   for (const py of pythons) {
-    const r = await $.process.run([...py, script, 'job', 'status', '--line']).catch(() => undefined)
-    if (r && r.exitCode === 0) { line = r.stdout.trim(); break }
+    const r = await $.process.run([...py, script, ...args]).catch(() => undefined)
+    if (r && r.exitCode === 0) return r.stdout.trim()
   }
+  return undefined
+}
+
+// The open job, as one line, from tokprep itself (it owns the job files). The mod draws no status line or notices.
+async function refreshJob($: EngineInterface) {
+  const line = await runTokprep($, ['job', 'status', '--line'])
   jobLine = line && line.startsWith('job ') ? line : undefined
 }
+
+// Code navigation goes through graphify's knowledge graph; token-saver installs it on any machine that lacks it.
+const GRAPHIFY = 'Code navigation: when graphify-out/graph.json exists, run `graphify query "<question>"` before the first grep or source read ' +
+  '(`graphify path "<A>" "<B>"`, `graphify explain "<concept>"`), read raw files only for lines it located, and run `graphify update .` after code edits. ' +
+  'No graph in a real codebase: suggest `/graphify .` once. Use graphify for code structure, tokprep for media and single long files.'
 
 export const register: Register = on => {
 
   on('prompt.compose', async ($, e, next) => {
     const composed = await next(e)
     return { ...composed, sections: [...composed.sections, { id: 'token-saver:command', scope: 'session' as const,
-      text: `Local media/file prep on this machine: ${tokprep($.plugin.root)} <command> (see the token-saver skill). ${FALLBACK}` }] }
+      text: `Local media/file prep on this machine: ${tokprep($.plugin.root)} <command> (see the token-saver skill). ${FALLBACK}\n${GRAPHIFY}` }] }
   }).catch(($, e, next) => next(e))
 
   on('session.start', async ($, e, next) => {
     const started = await next(e)
     await refreshJob($)
+    void runTokprep($, ['graphify', 'setup']).catch(() => undefined)   // installs graphify in the background; quick no-op once it is there
     return started
   })
 

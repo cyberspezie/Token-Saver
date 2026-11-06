@@ -98,5 +98,17 @@ test('the system prompt carries the tokprep command for this machine and the do-
   const mine = r.sections.find(s => s.id === 'token-saver:command')
   expect(mine?.text).toMatch(/bin\/tokprep/)
   expect(mine?.text).toMatch(/NOT AVAILABLE/)
+  expect(mine?.text).toMatch(/graphify query/)
   expect(mine?.scope).toBe('session')
+})
+
+test('session start installs graphify in the background through tokprep', async ($, on) => {
+  const runs: string[] = []
+  on('process.run', (_, e) => { runs.push((e as { argv?: string[]; command?: string[] }).argv?.join(' ') ?? JSON.stringify(e)); return { value: { exitCode: 0, stdout: 'graphify ready\n', stderr: '' } } })
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await new Promise(r => setTimeout(r, 0))
+
+  expect(runs.some(r => /graphify.*setup/.test(r))).toBe(true)
 })

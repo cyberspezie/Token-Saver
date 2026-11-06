@@ -39,3 +39,7 @@ Rules:
 - **Cutouts:** check the coverage numbers. 0% means no subject was found; above 80% means the background was kept. Look at the before/after sheet only if those look wrong. `--mode person` is for people only; `subject` also catches objects and dark silhouettes.
 - **Chroma key:** a green halo means raise `--similarity` (0.15–0.2); holes in the subject mean lower it (0.08).
 - **Formats:** transparent video comes out as ProRes 4444 `.mov`. WebP is not available in this ffmpeg build: use AVIF or JPG.
+
+## Code: graphify first
+
+For questions about a codebase, use graphify, not tokprep. When `graphify-out/graph.json` exists, run `graphify query "<question>"` before grepping or reading source, `graphify path "<A>" "<B>"` for relationships, `graphify explain "<concept>"` for one concept, and `graphify update .` after code edits. No graph yet: suggest `/graphify .` once. If `graphify` is not found, run `tokprep graphify setup` (the plugin also does this at session start).
