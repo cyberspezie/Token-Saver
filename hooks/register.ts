@@ -57,7 +57,11 @@ export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     const started = await next(e)
     await refreshJob($)
-    void runTokprep($, ['graphify', 'setup']).catch(() => undefined)   // installs graphify in the background; quick no-op once it is there
+    // First sessions after install: set graphify up in the background. Once it reports ready, the store remembers and this never runs again.
+    if ((await $.store.get('graphify')) !== 'ready') void (async () => {
+      const out = await runTokprep($, ['graphify', 'setup'])
+      if (out?.startsWith('graphify ready')) await $.store.set('graphify', 'ready')
+    })().catch(() => undefined)
     return started
   })
 

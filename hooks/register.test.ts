@@ -102,13 +102,20 @@ test('the system prompt carries the tokprep command for this machine and the do-
   expect(mine?.scope).toBe('session')
 })
 
-test('session start installs graphify in the background through tokprep', async ($, on) => {
+test('graphify is set up at the first session start, then never again once ready', async ($, on) => {
   const runs: string[] = []
-  on('process.run', (_, e) => { runs.push((e as { argv?: string[]; command?: string[] }).argv?.join(' ') ?? JSON.stringify(e)); return { value: { exitCode: 0, stdout: 'graphify ready\n', stderr: '' } } })
+  const store = new Map<string, unknown>()
+  on('store.get', (_, e) => ({ value: store.get(e.key) }))
+  on('store.set', (_, e) => { store.set(e.key, e.value); return { value: undefined } })
+  on('process.run', (_, e) => { runs.push(e.argv.join(' ')); return { value: { exitCode: 0, stdout: 'graphify ready at /x/graphify\n', stderr: '' } } })
   on('session.start', (_, e) => ({ cwd: e.cwd }))
 
   await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
   await new Promise(r => setTimeout(r, 0))
+  expect(runs.filter(r => /graphify setup/.test(r)).length).toBe(1)
+  expect(store.get('graphify')).toBe('ready')
 
-  expect(runs.some(r => /graphify.*setup/.test(r))).toBe(true)
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await new Promise(r => setTimeout(r, 0))
+  expect(runs.filter(r => /graphify setup/.test(r)).length).toBe(1)
 })

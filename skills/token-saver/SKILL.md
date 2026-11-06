@@ -42,4 +42,4 @@ Rules:
 
 ## Code: graphify first
 
-For questions about a codebase, use graphify, not tokprep. When `graphify-out/graph.json` exists, run `graphify query "<question>"` before grepping or reading source, `graphify path "<A>" "<B>"` for relationships, `graphify explain "<concept>"` for one concept, and `graphify update .` after code edits. No graph yet: suggest `/graphify .` once. If `graphify` is not found, run `tokprep graphify setup` (the plugin also does this at session start).
+For questions about a codebase, use graphify, not tokprep. When `graphify-out/graph.json` exists, run `graphify query "<question>"` before grepping or reading source, `graphify path "<A>" "<B>"` for relationships, `graphify explain "<concept>"` for one concept, and `graphify update .` after code edits. No graph yet: suggest `/graphify .` once. If `graphify` is not found, run `tokprep graphify setup` (the plugin does this once, after it is installed).
